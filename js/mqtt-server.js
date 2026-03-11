@@ -12,7 +12,7 @@ class MQTTServer {
         this.protoRoot = null;
         this.publishInterval = null;
         this.messageCount = 0;
-        
+
         // 模拟数据计数器
         this.simulationCounters = {
             gameRound: 1,
@@ -25,19 +25,36 @@ class MQTTServer {
     this.clientTopicPrefix = '';
     this.serverMessageNames = [];
     this.clientMessageNames = [];
+
+    // 存储客户端上传的数据
+    this.clientDataStore = {};
     }
 
     async loadProto() {
         try {
             const protoPath = path.join(__dirname, '..', 'proto', 'messages.proto');
-            // 读取原始 proto 文本并尝试清理多余的 package 定义（某些 proto 文件中可能重复写了 package）
-            const protoTextRaw = fs.readFileSync(protoPath, 'utf8');
-            const protoTextSanitized = protoTextRaw.replace(/^\s*package\s+\S+;\s*$/gm, '');
-            const parsed = protobuf.parse(protoTextSanitized);
-            this.protoRoot = parsed.root;
-            // 解析 proto 文本找出消息的发布方向（注释中有 "发送方: 服务器 -> 自定义客户端" / "发送方: 自定义客户端 -> 服务器"）
             const protoText = fs.readFileSync(protoPath, 'utf8');
             const lines = protoText.split(/\r?\n/);
+
+            const upIndex = lines.findIndex(l => /^\s*package\s+rm_client_up\s*;/.test(l));
+            const downIndex = lines.findIndex(l => /^\s*package\s+rm_client_down\s*;/.test(l));
+
+            const upProto = ['syntax = "proto3";', 'package rm_client_up;', ...lines.slice(upIndex + 1, downIndex)].join('\n');
+            const downProto = ['syntax = "proto3";', 'package rm_client_down;', ...lines.slice(downIndex + 1)].join('\n');
+
+            const upParsed = protobuf.parse(upProto);
+            const downParsed = protobuf.parse(downProto);
+
+            this.protoRoot = new protobuf.Root();
+            this.protoRoot.nested = {};
+            if (upParsed.root.nested.rm_client_up) {
+                this.protoRoot.nested.rm_client_up = upParsed.root.nested.rm_client_up;
+                this.protoRoot.nested.rm_client_up.parent = this.protoRoot;
+            }
+            if (downParsed.root.nested.rm_client_down) {
+                this.protoRoot.nested.rm_client_down = downParsed.root.nested.rm_client_down;
+                this.protoRoot.nested.rm_client_down.parent = this.protoRoot;
+            }
             const foundServer = new Set();
             const foundClient = new Set();
 
@@ -145,11 +162,11 @@ class MQTTServer {
                         // 处理直接以消息名作为 topic 的情况，例如 'RemoteControl'
                         const name = topic;
                         if (name && this.clientMessageNames.includes(name)) {
-                            MessageType = this.protoRoot.lookupType(name);
+                            MessageType = this.protoRoot.lookupType(`rm_client_up.${name}`);
                             mapping = { msg: name, sampleRate: 1 };
                         }
                     } else {
-                        MessageType = this.protoRoot.lookupType(mapping.msg);
+                        MessageType = this.protoRoot.lookupType(`rm_client_up.${mapping.msg}`);
                     }
 
                     if (!MessageType || !mapping) return; // 对于没有映射的主题不处理
@@ -165,10 +182,21 @@ class MQTTServer {
                         return;
                     }
 
+                    const obj = MessageType.toObject(decoded, { longs: String, enums: String, bytes: Buffer, keepCase: true });
+
+                    // 存储客户端数据
+                    if (!this.clientDataStore[client.id]) {
+                        this.clientDataStore[client.id] = {};
+                    }
+                    this.clientDataStore[client.id][mapping.msg] = {
+                        data: obj,
+                        timestamp: Date.now(),
+                        topic: topic
+                    };
+
                     if (shouldLog) {
-                        const obj = MessageType.toObject(decoded, { longs: String, enums: String, bytes: Buffer });
                         console.log(`📥 收到客户端消息 - 客户端: ${client.id}, 主题: ${topic}, 类型: ${mapping.msg}`);
-                        console.log('   内容预览:', JSON.stringify(obj).substring(0, 200));
+                        console.log('   内容:', JSON.stringify(obj));
                     }
                 } catch (err) {
                     console.error('❌ 处理客户端发布消息时发生错误:', err.message);
@@ -277,7 +305,7 @@ class MQTTServer {
             const selectedData = mockData[this.toCamelCase(selectedType)] || mockData[selectedType] || mockData[this.fromProtoName(selectedType)];
 
             // 获取消息类型定义
-            const MessageType = this.protoRoot.lookupType(selectedType);
+            const MessageType = this.protoRoot.lookupType(`rm_client_down.${selectedType}`);
             
             // 将 snake_case 键名转换为 camelCase，以适配 protobufjs 的字段名
             const normalizedData = this.convertKeysToCamel(selectedData);
@@ -364,6 +392,16 @@ class MQTTServer {
             return newObj;
         }
         return value;
+    }
+
+    getClientData(clientId, messageType) {
+        if (clientId && messageType) {
+            return this.clientDataStore[clientId]?.[messageType];
+        }
+        if (clientId) {
+            return this.clientDataStore[clientId];
+        }
+        return this.clientDataStore;
     }
 
     stop() {

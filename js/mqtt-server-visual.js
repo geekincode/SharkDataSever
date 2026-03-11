@@ -297,19 +297,49 @@ class VisualMQTTServer {
         try {
             const protoPath = path.join(__dirname, '..', 'proto', 'messages.proto');
             const protoText = fs.readFileSync(protoPath, 'utf8');
-            
-            // 清理并解析proto
-            const protoTextSanitized = protoText.replace(/^\s*package\s+\S+;\s*$/gm, '');
-            const parsed = protobuf.parse(protoTextSanitized);
-            this.protoRoot = parsed.root;
-            
+
+            // 分割proto文件为两个package
+            const lines = protoText.split(/\r?\n/);
+            const upIndex = lines.findIndex(l => /^\s*package\s+rm_client_up\s*;/.test(l));
+            const downIndex = lines.findIndex(l => /^\s*package\s+rm_client_down\s*;/.test(l));
+
+            // 构建上行消息proto
+            const upProto = [
+                'syntax = "proto3";',
+                'package rm_client_up;',
+                ...lines.slice(upIndex + 1, downIndex)
+            ].join('\n');
+
+            // 构建下行消息proto
+            const downProto = [
+                'syntax = "proto3";',
+                'package rm_client_down;',
+                ...lines.slice(downIndex + 1)
+            ].join('\n');
+
+            // 解析两个proto
+            const upParsed = protobuf.parse(upProto);
+            const downParsed = protobuf.parse(downProto);
+
+            // 创建合并的root
+            this.protoRoot = new protobuf.Root();
+            this.protoRoot.nested = {};
+            if (upParsed.root.nested.rm_client_up) {
+                this.protoRoot.nested.rm_client_up = upParsed.root.nested.rm_client_up;
+                this.protoRoot.nested.rm_client_up.parent = this.protoRoot;
+            }
+            if (downParsed.root.nested.rm_client_down) {
+                this.protoRoot.nested.rm_client_down = downParsed.root.nested.rm_client_down;
+                this.protoRoot.nested.rm_client_down.parent = this.protoRoot;
+            }
+
             // 解析消息和注释
             this.parseProtoMessages(protoText);
-            
+
             console.log('✅ Protobuf 定义加载成功');
             console.log(`📤 下行消息 (服务器->客户端): ${this.serverMessageNames.length} 个`);
             console.log(`📥 上行消息 (客户端->服务器): ${this.clientMessageNames.length} 个`);
-            
+
             return true;
         } catch (error) {
             console.error('❌ Protobuf 加载失败:', error.message);
@@ -471,14 +501,15 @@ class VisualMQTTServer {
                 for (const msgName of this.clientMessageNames) {
                     if (topic.includes(msgName) || topic === msgName) {
                         try {
-                            const MessageType = this.protoRoot.lookupType(msgName);
+                            const MessageType = this.protoRoot.lookupType(`rm_client_up.${msgName}`);
                             const decoded = MessageType.decode(packet.payload);
-                            const obj = MessageType.toObject(decoded, { 
-                                longs: String, 
-                                enums: String, 
-                                bytes: String 
+                            const obj = MessageType.toObject(decoded, {
+                                longs: String,
+                                enums: String,
+                                bytes: String,
+                                keepCase: true
                             });
-                            
+
                             // 解析字段的实际含义
                             const parsedData = this.parseFieldValues(msgName, obj);
                             
@@ -588,9 +619,9 @@ class VisualMQTTServer {
         req.on('end', () => {
             try {
                 const { messageType, data, topic } = JSON.parse(body);
-                
-                // 获取消息类型
-                const MessageType = this.protoRoot.lookupType(messageType);
+
+                // 获取消息类型（下行消息使用 rm_client_down 包）
+                const MessageType = this.protoRoot.lookupType(`rm_client_down.${messageType}`);
                 
                 // 转换数据
                 const convertedData = this.convertKeysToCamel(data);
@@ -687,7 +718,7 @@ class VisualMQTTServer {
 
         const timer = setInterval(() => {
             try {
-                const MessageType = this.protoRoot.lookupType(messageType);
+                const MessageType = this.protoRoot.lookupType(`rm_client_down.${messageType}`);
                 const convertedData = this.convertKeysToCamel(template);
                 const errMsg = MessageType.verify(convertedData);
                 if (errMsg) return;
@@ -780,24 +811,25 @@ class VisualMQTTServer {
 
     parseFieldValues(messageType, data) {
         const metadata = this.messageMetadata[messageType];
-        if (!metadata || !metadata.fields) return {};
-
         const parsed = {};
-        
+
         for (const [fieldName, value] of Object.entries(data)) {
-            // 尝试查找字段元数据（支持camelCase和snake_case）
-            let fieldMeta = metadata.fields[fieldName];
-            if (!fieldMeta) {
-                // 尝试转换为snake_case
-                const snakeName = fieldName.replace(/([A-Z])/g, '_$1').toLowerCase().replace(/^_/, '');
-                fieldMeta = metadata.fields[snakeName];
+            let fieldMeta = null;
+
+            // 尝试查找字段元数据
+            if (metadata && metadata.fields) {
+                fieldMeta = metadata.fields[fieldName];
+                if (!fieldMeta) {
+                    const snakeName = fieldName.replace(/([A-Z])/g, '_$1').toLowerCase().replace(/^_/, '');
+                    fieldMeta = metadata.fields[snakeName];
+                }
+                if (!fieldMeta) {
+                    const camelName = fieldName.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+                    fieldMeta = metadata.fields[camelName];
+                }
             }
-            if (!fieldMeta) {
-                // 尝试转换为camelCase
-                const camelName = fieldName.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
-                fieldMeta = metadata.fields[camelName];
-            }
-            
+
+            // 如果没有元数据，使用默认显示
             if (!fieldMeta) {
                 parsed[fieldName] = { value, display: String(value) };
                 continue;
@@ -1983,11 +2015,14 @@ class VisualMQTTServer {
         // 更新上行消息接收到的数据显示
         function updateUplinkReceivedData(messageType, parsedData) {
             for (const [fieldName, fieldInfo] of Object.entries(parsedData)) {
-                const valueEl = document.getElementById('value-' + messageType + '-' + fieldName);
+                // 将 camelCase 转换为 snake_case 以匹配元素 ID
+                const snakeFieldName = fieldName.replace(/([A-Z])/g, '_$1').toLowerCase().replace(/^_/, '');
+                const elementId = 'value-' + messageType + '-' + snakeFieldName;
+                const valueEl = document.getElementById(elementId);
                 if (valueEl) {
                     // 清空原有内容
                     valueEl.innerHTML = '';
-                    
+
                     // 创建值显示
                     const valueDiv = document.createElement('div');
                     valueDiv.className = 'field-value-received';
